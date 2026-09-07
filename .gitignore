@@ -1,0 +1,31 @@
+# ── Secrets — never commit ───────────────────────────────────────────────
+config/api_keys.json
+config/.vault.key
+config/certs/
+*.pem
+*.key
+
+# ── Runtime state (encrypted at rest, still private) ─────────────────────
+data/*.json
+data/_debug*
+memory/*.json
+*.log
+
+# ── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ── Sidecar / models ─────────────────────────────────────────────────────
+integrations/barehands/
+data/models/
+
+# ── Editor / OS ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.bak
