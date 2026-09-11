@@ -49,6 +49,13 @@ def test_search_edit_kind():
     assert search_edit_kind("Type a message") == ""
 
 
+def test_win32_call_keys_mapped():
+    from actions._whatsapp_ui import _VK
+
+    for key in ("enter", "down", "space", "ctrl", "a", "backspace"):
+        assert key in _VK
+
+
 def test_call_banner_copy():
     title, detail = banner_copy("Saharsh", video=False)
     parsed = parse_banner(title, detail)
@@ -83,6 +90,7 @@ if __name__ == "__main__":
     test_window_enum_does_not_crash()
     test_contact_list_item_re()
     test_search_edit_kind()
+    test_win32_call_keys_mapped()
     test_call_banner_copy()
     test_plugins_discover_and_status()
     print("ok")

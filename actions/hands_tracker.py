@@ -29,9 +29,11 @@ from actions.hands_gestures import (
     PINCH_OFF_FRAMES,
     PINCH_ON,
     PINCH_ON_FRAMES,
+    POSE_COOL,
     Cursor,
     claw_snap,
     decide_pinch,
+    fire_pose,
     measure,
     peak_velocity,
     pinch_ratio,
@@ -264,6 +266,7 @@ class HandsBoard:
     _clap_hist: list = field(default_factory=list)
     _clap_until: float = 0.0
     _clear_until: float = 0.0
+    _pose_until: float = 0.0
     _last_cursor: tuple[float, float] = (0.50, 0.48)
     camera_index: int = 0
     debug: bool = False
@@ -272,6 +275,7 @@ class HandsBoard:
     _toast_until: float = 0.0
     _cam_cycle: bool = False
     _presented: Optional[int] = None
+    gpu_models: bool = False
 
     def toast(self, text: str, hold: float = 1.4) -> None:
         self._toast = text
@@ -282,7 +286,7 @@ class HandsBoard:
             return self._toast
         if self.debug:
             return "DEBUG  ·  C camera  ·  R reset  ·  D overlay"
-        return "Drop a file on the glass · tap FRIDAY · pinch · clap reset · O open"
+        return "Drop a file on the glass · tap FRIDAY · pinch · peace explode · thumbs up rebuild"
 
     def set_ring_state(self, state: str) -> None:
         key = (state or "").strip().lower()
@@ -435,7 +439,7 @@ class HandsBoard:
         holo = True if err else (wants_holo(path) if path else True)
         with self._lock:
             self.cards.append(Card(
-                title, "pinch to turn · two hands scale · empty pinch scrubs explode",
+                title, "pinch to turn · peace explodes · thumbs up rebuilds",
                 cx, cy, 0.42, 0.42, kind="model", uid=_next_uid(),
                 model=src, holo=holo,
                 anim={"k": "in", "t": 0.0},
@@ -443,7 +447,7 @@ class HandsBoard:
         if err:
             self.toast(f"couldn't read {p.name}: {err[:80]}")
         else:
-            self.toast(f"3D {title} — hold still to spin, empty pinch scrubs explode")
+            self.toast(f"3D {title} — peace explodes, thumbs up brings it back")
 
     def present_model(self, path: str = "", title: str = "") -> None:
         from actions.hands_models import load_model, wants_holo
@@ -728,7 +732,7 @@ class HandsBoard:
                         self._end_grab(held, i, cur, now)
                     cur.scrub = None
 
-                self._tick_scrub(i, cur)
+                self._tick_poses(i, cur, m, now, hint)
 
                 if not cur.pinched:
                     if cur.palm_open or cur.soft_open:
@@ -758,35 +762,27 @@ class HandsBoard:
                 )
         return hint
 
-    def _tick_scrub(self, i: int, cur: Cursor) -> None:
+    def _tick_poses(self, i: int, cur: Cursor, m, now: float, hint: dict) -> None:
+        hint["peace"] = bool(hint.get("peace") or m.peace)
+        hint["thumbs"] = bool(hint.get("thumbs") or m.thumbs)
         holding = any(i in c.grabbed_by for c in self.cards)
-        if cur.pinched and not holding:
-            if not cur.scrub:
-                models = [c for c in self.cards if c.kind == "model"]
-                m = models[-1] if models else None
-                cur.scrub = {
-                    "id": m.uid if m else None,
-                    "sx": cur.x,
-                    "base": (m.ex if m else 0.0),
-                    "live": False,
-                }
-            elif cur.scrub.get("id") is not None:
-                m = next((c for c in self.cards if c.uid == cur.scrub["id"]), None)
-                if m is not None:
-                    dx = cur.x - cur.scrub["sx"]
-                    if not cur.scrub["live"] and abs(dx) > 0.03:
-                        cur.scrub["live"] = True
-                        cur.scrub["sx"] = cur.x
-                        cur.scrub["base"] = m.ex
-                        self.toast(
-                            "scrubbing — drag right to explode, left to rebuild"
-                            if m.ex < 0.5
-                            else "scrubbing — drag left to rebuild"
-                        )
-                    if cur.scrub["live"]:
-                        m.ex = min(1.0, max(0.0, cur.scrub["base"] + (cur.x - cur.scrub["sx"]) / 0.34))
-        elif not cur.pinched:
-            cur.scrub = None
+        if holding or cur.pinched:
+            cur.peace_run = 0
+            cur.thumb_run = 0
+            return
+        model = next((c for c in reversed(self.cards) if c.kind == "model"), None)
+        if model is None:
+            cur.peace_run = 0
+            cur.thumb_run = 0
+            return
+        if fire_pose(cur, m.peace, "peace_run", now, self._pose_until):
+            model.ex = 1.0
+            self._pose_until = now + POSE_COOL
+            self.toast("peace — explode")
+        elif fire_pose(cur, m.thumbs, "thumb_run", now, self._pose_until):
+            model.ex = 0.0
+            self._pose_until = now + POSE_COOL
+            self.toast("thumbs up — assemble")
 
     def _tick_claw(self, i: int, cur: Cursor, m, now: float, hint: dict) -> None:
         holding = any(i in c.grabbed_by for c in self.cards)
@@ -1084,23 +1080,33 @@ def _open_capture(idx: int | None = None):
         raise RuntimeError("OpenCV is not installed.")
     if idx is None:
         idx = _camera_index()
-    cap = cv2.VideoCapture(idx, _backend())
-    if not cap.isOpened():
-        for alt in range(8):
-            cap = cv2.VideoCapture(alt, _backend())
-            if cap.isOpened():
-                idx = alt
-                break
-    if not cap.isOpened():
-        raise RuntimeError("Could not open the webcam.")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
-    cap.set(cv2.CAP_PROP_FPS, 24)
-    try:
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    except Exception:
-        pass
-    return cap, idx
+    last = None
+    for _try in range(8):
+        cap = cv2.VideoCapture(idx, _backend())
+        if not cap.isOpened():
+            for alt in range(8):
+                cap = cv2.VideoCapture(alt, _backend())
+                if cap.isOpened():
+                    idx = alt
+                    break
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+            cap.set(cv2.CAP_PROP_FPS, 24)
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                return cap, idx
+            last = "Webcam opened but returned no frames."
+            cap.release()
+        else:
+            last = "Could not open the webcam."
+        if _try < 7:
+            time.sleep(0.18)
+    raise RuntimeError(last or "Could not open the webcam.")
 
 
 def _make_landmarker(path: Path):
@@ -1198,48 +1204,49 @@ def _blit_image(frame, img, x1: int, y1: int, x2: int, y2: int) -> bool:
     return True
 
 
-def _draw_model(frame, card: Card, dim: bool = False) -> None:
+def _draw_model(frame, card: Card, dim: bool = False, skip_mesh: bool = False) -> None:
     from actions.hands_models import load_model, project_model, demo_engine
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = _card_rect(card, w, h)
     cx = (x1 + x2) // 2
     cy = (y1 + y2) // 2
     radius = max(28.0, min(x2 - x1, y2 - y1) * 0.48)
-    try:
-        model = load_model(card.model)
-    except Exception:
-        model = demo_engine()
-    try:
-        projected = project_model(model, card.rx, card.ry, card.ex, cx, cy, radius)
-    except Exception:
-        projected = []
     wire = (0, 80, 90) if dim else ((0, 255, 210) if card.holo else (40, 180, 255))
-    fill = (0, 40, 50) if dim else ((0, 70, 80) if card.holo else (20, 90, 140))
-    if not card.holo and not dim:
-        for xy, _edges, faces in projected:
-            if len(faces) == 0 or len(xy) < 3:
-                continue
-            step = max(1, len(faces) // 400)
-            for tri in faces[::step]:
-                if np.any(tri < 0) or np.any(tri >= len(xy)):
+    if not skip_mesh:
+        fill = (0, 40, 50) if dim else ((0, 70, 80) if card.holo else (20, 90, 140))
+        try:
+            model = load_model(card.model)
+        except Exception:
+            model = demo_engine()
+        try:
+            projected = project_model(model, card.rx, card.ry, card.ex, cx, cy, radius)
+        except Exception:
+            projected = []
+        if not card.holo and not dim:
+            for xy, _edges, faces in projected:
+                if len(faces) == 0 or len(xy) < 3:
                     continue
-                try:
-                    cv2.fillConvexPoly(frame, xy[tri], fill, cv2.LINE_AA)
-                except Exception:
-                    continue
-    for xy, edges, _faces in projected:
-        n = len(xy)
-        if len(edges):
-            for a, b in edges:
-                ia, ib = int(a), int(b)
-                if 0 <= ia < n and 0 <= ib < n:
-                    cv2.line(frame, tuple(xy[ia]), tuple(xy[ib]), wire, 1, cv2.LINE_AA)
-        elif n:
-            for p in xy[:: max(1, n // 400)]:
-                cv2.circle(frame, (int(p[0]), int(p[1])), 1, wire, -1, cv2.LINE_AA)
-    if card.holo and not dim:
-        scan = int(cy - radius + (time.monotonic() % 1.6) / 1.6 * radius * 2)
-        cv2.line(frame, (int(cx - radius), scan), (int(cx + radius), scan), (0, 255, 180), 1, cv2.LINE_AA)
+                step = max(1, len(faces) // 400)
+                for tri in faces[::step]:
+                    if np.any(tri < 0) or np.any(tri >= len(xy)):
+                        continue
+                    try:
+                        cv2.fillConvexPoly(frame, xy[tri], fill, cv2.LINE_AA)
+                    except Exception:
+                        continue
+        for xy, edges, _faces in projected:
+            n = len(xy)
+            if len(edges):
+                for a, b in edges:
+                    ia, ib = int(a), int(b)
+                    if 0 <= ia < n and 0 <= ib < n:
+                        cv2.line(frame, tuple(xy[ia]), tuple(xy[ib]), wire, 1, cv2.LINE_AA)
+            elif n:
+                for p in xy[:: max(1, n // 400)]:
+                    cv2.circle(frame, (int(p[0]), int(p[1])), 1, wire, -1, cv2.LINE_AA)
+        if card.holo and not dim:
+            scan = int(cy - radius + (time.monotonic() % 1.6) / 1.6 * radius * 2)
+            cv2.line(frame, (int(cx - radius), scan), (int(cx + radius), scan), (0, 255, 180), 1, cv2.LINE_AA)
     if card.ex > 0.05:
         cv2.putText(frame, f"EX {int(card.ex * 100)}%", (x1, y2 + 16),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, wire, 1, cv2.LINE_AA)
@@ -1302,7 +1309,7 @@ def draw_board(frame, board: HandsBoard, hands, hint: dict, banner: str = "") ->
             # 3D FRIDAY orb is painted by HandsBoardWidget with the HUD renderer.
             continue
         if card.kind == "model":
-            _draw_model(frame, card, dim=spotlight and not card.presented)
+            _draw_model(frame, card, dim=spotlight and not card.presented, skip_mesh=board.gpu_models)
             continue
         x1, y1, x2, y2 = _card_rect(card, w, h)
         dim = spotlight and not card.presented

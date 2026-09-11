@@ -136,6 +136,39 @@ def _fist(x: float, y: float):
     return pts
 
 
+def _peace(x: float, y: float):
+    pts = [(x, y)] * 21
+    pts[0] = (x, y + 0.22)
+    pts[2] = (x - 0.05, y + 0.10)
+    pts[4] = (x - 0.12, y + 0.04)
+    pts[5] = (x - 0.03, y + 0.08)
+    pts[8] = (x - 0.04, y - 0.14)
+    pts[9] = (x, y + 0.09)
+    pts[12] = (x + 0.01, y - 0.14)
+    pts[13] = (x + 0.03, y + 0.10)
+    pts[16] = (x + 0.04, y + 0.12)
+    pts[17] = (x + 0.06, y + 0.11)
+    pts[20] = (x + 0.07, y + 0.13)
+    return pts
+
+
+def _thumbs_up(x: float, y: float):
+    pts = [(x, y)] * 21
+    pts[0] = (x, y + 0.20)
+    pts[2] = (x - 0.02, y + 0.04)
+    pts[3] = (x - 0.02, y - 0.04)
+    pts[4] = (x - 0.02, y - 0.14)
+    pts[5] = (x - 0.02, y + 0.08)
+    pts[8] = (x - 0.02, y + 0.10)
+    pts[9] = (x, y + 0.08)
+    pts[12] = (x, y + 0.10)
+    pts[13] = (x + 0.03, y + 0.09)
+    pts[16] = (x + 0.03, y + 0.11)
+    pts[17] = (x + 0.05, y + 0.10)
+    pts[20] = (x + 0.05, y + 0.12)
+    return pts
+
+
 def test_plugin_discovers():
     reg = discover_plugins(ROOT / "plugins", set(), logger=lambda *_: None)
     assert reg.has("hands_board")
@@ -398,6 +431,22 @@ def test_demo_engine_explodes():
     assert float(np.linalg.norm(e0 - e1)) > float(np.linalg.norm(c0 - c1))
 
 
+def test_gpu_pack_has_lines_and_explode_dirs():
+    import numpy as np
+    from actions.hands_models import demo_engine, ensure_gpu, gpu_pack
+    model = demo_engine()
+    pos, dr, idx = ensure_gpu(model)
+    assert pos.shape[1] == 3
+    assert pos.shape == dr.shape
+    assert len(pos) >= 8
+    assert idx.dtype == np.uint32
+    assert len(idx) >= 6
+    assert len(idx) % 2 == 0
+    # parts fly along different explode axes
+    packed = gpu_pack(model)
+    assert not np.allclose(packed[1][0], packed[1][-1])
+
+
 def test_load_obj_triangle():
     import tempfile
     from actions.hands_models import load_model
@@ -516,7 +565,7 @@ def test_draw_model_wires():
     assert int(frame[:, :, 1].max()) > 80
 
 
-def test_empty_pinch_scrubs_explode():
+def test_empty_pinch_does_not_explode():
     board = HandsBoard()
     board.add_model("", "ENGINE")
     for _ in range(PINCH_ON_FRAMES + 1):
@@ -524,7 +573,29 @@ def test_empty_pinch_scrubs_explode():
     assert not any(c.grabbed for c in board.snapshot())
     for i in range(14):
         board.tick([_ok_pinch(0.82 + i * 0.01, 0.18)], 0.03)
-    assert board.snapshot()[0].ex > 0.15
+    assert board.snapshot()[0].ex == 0.0
+
+
+def test_peace_explodes_model():
+    from actions.hands_gestures import POSE_HOLD_FRAMES, measure
+    assert measure(_peace(0.70, 0.40)).peace
+    board = HandsBoard()
+    board.add_model("", "ENGINE")
+    for _ in range(POSE_HOLD_FRAMES + 2):
+        board.tick([_peace(0.70, 0.40)], 0.03)
+    assert board.snapshot()[0].ex == 1.0
+
+
+def test_thumbs_up_assembles_model():
+    from actions.hands_gestures import POSE_HOLD_FRAMES, measure
+    assert measure(_thumbs_up(0.70, 0.40)).thumbs
+    board = HandsBoard()
+    board.add_model("", "ENGINE")
+    board.explode()
+    assert board.snapshot()[0].ex == 1.0
+    for _ in range(POSE_HOLD_FRAMES + 2):
+        board.tick([_thumbs_up(0.70, 0.40)], 0.03)
+    assert board.snapshot()[0].ex == 0.0
 
 
 def test_plugin_add_model_and_explode():

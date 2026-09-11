@@ -143,8 +143,9 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             player.start_hands_board()
             result = (
                 "Hands board is open. Pinch thumb and index to grab, tap to open, "
-                "two hands to scale, hold still to rotate, clap to reset, "
-                "claw to force-pull. C cycles cameras, D debug, R reset."
+                "two hands to scale, hold still to rotate, peace to explode a 3D model, "
+                "thumbs up to rebuild, clap to reset, claw to force-pull. "
+                "C cycles cameras, D debug, R reset."
             )
         elif action in ("close", "stop", "quit"):
             miss = _need_ui(player)
@@ -205,7 +206,7 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
                 _ensure_open(player)
                 if _is_model(image) and hasattr(player, "add_hands_model"):
                     player.add_hands_model(image, title)
-                    result = "Put that 3D model on the glass. Hold still to spin, empty pinch scrubs explode."
+                    result = "Put that 3D model on the glass. Peace explodes it, thumbs up brings it back."
                 else:
                     player.add_hands_image(image, title)
                     result = "Put that file on the glass. Pinch to move it."
@@ -222,7 +223,7 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
                 player.add_hands_image(image or "demo://engine", title)
             result = (
                 "Dropped a 3D hologram on the glass. Hold still to spin, "
-                "two hands to scale, empty pinch and drag to explode."
+                "two hands to scale, peace sign to explode, thumbs up to rebuild."
             )
         elif action in ("hand", "give"):
             miss = _need_ui(player)
@@ -284,7 +285,7 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             _ensure_open(player)
             if hasattr(player, "explode_hands_model"):
                 player.explode_hands_model(title)
-            result = "Exploding the 3D model. Empty pinch and drag also scrubs it apart."
+            result = "Exploding the 3D model. Hold a peace sign on the glass to do this by hand."
         elif action in ("assemble", "rebuild"):
             miss = _need_ui(player)
             if miss:
@@ -292,7 +293,7 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             _ensure_open(player)
             if hasattr(player, "assemble_hands_model"):
                 player.assemble_hands_model(title)
-            result = "Assembling the 3D model back together."
+            result = "Assembling the 3D model. Hold a thumbs up on the glass to do this by hand."
         else:
             result = (
                 "Specify action: open, close, present, add_card, add_img, add_model, "

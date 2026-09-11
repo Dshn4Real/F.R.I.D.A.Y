@@ -2,8 +2,9 @@
 
 Production rules:
 - Never claim success unless we verified the UI actually changed.
-- Prefer UI Automation (invoke) over mouse clicks.
-- If we must click, click relative to the WhatsApp window — never the whole screen.
+- Store WhatsApp is WebView2 HTML. UIA Invoke is a no-op — click the control rect
+  (Win32 SendInput / pywinauto click_input) or Playwright CDP. Do not use pyautogui.
+- Keep Friday's window behind WhatsApp while driving the UI.
 - Do not steal the user's clipboard without restoring it.
 - Background watchers never auto-click accept/decline unless UIA found the button.
 """
@@ -469,10 +470,23 @@ def _force_foreground(hwnd: int) -> bool:
     return True
 
 
+def _hwnds_friday() -> list[int]:
+    """Friday HUD / main window — must go behind WhatsApp or clicks hit us."""
+    found: list[int] = []
+    if os.name != "nt":
+        return found
+    for w in _win32_windows(visible_only=False):
+        t = (w.get("title") or "").lower()
+        if "friday" in t and int(w.get("hwnd") or 0):
+            found.append(int(w["hwnd"]))
+    return found
+
+
 @contextmanager
 def whatsapp_front():
-    """Keep WhatsApp above FRIDAY's always-on-top HUD while we screenshot/type."""
+    """Keep WhatsApp above Friday so WebView2 actually receives input."""
     hwnds = _hwnds_whatsapp() if os.name == "nt" else []
+    friday = _hwnds_friday() if os.name == "nt" else []
     if not hwnds:
         yield
         return
@@ -481,8 +495,11 @@ def whatsapp_front():
     user32 = ctypes.windll.user32
     HWND_TOPMOST = -1
     HWND_NOTOPMOST = -2
+    HWND_BOTTOM = 1
     flags = 0x0002 | 0x0001 | 0x0040  # NOSIZE | NOMOVE | SHOWWINDOW
     try:
+        for hwnd in friday:
+            user32.SetWindowPos(int(hwnd), HWND_BOTTOM, 0, 0, 0, 0, flags)
         for hwnd in hwnds:
             user32.SetWindowPos(int(hwnd), HWND_TOPMOST, 0, 0, 0, 0, flags)
         _force_foreground(int(hwnds[0]))
@@ -583,6 +600,11 @@ def _focus_whatsapp_window() -> bool:
 
 def _launch_whatsapp_windows() -> None:
     os.environ.setdefault("PYTHONUTF8", "1")
+    # Lets Playwright attach later. Only applies if this process starts WhatsApp.
+    os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = (
+        "--remote-debugging-port=9222 --remote-allow-origins=*"
+    )
+    env = os.environ.copy()
     try:
         os.startfile("whatsapp:")  # type: ignore[attr-defined]
     except Exception:
@@ -604,7 +626,12 @@ def _launch_whatsapp_windows() -> None:
     ]
     for path in candidates:
         if path.is_file():
-            subprocess.Popen([str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(
+                [str(path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
             return
     subprocess.Popen(
         ["cmd", "/c", "start", "", "whatsapp:"],
@@ -712,7 +739,44 @@ def _click_screen(x: int, y: int, *, clicks: int = 1) -> None:
             user32.mouse_event(0x0004, 0, 0, 0, 0)
             time.sleep(0.07)
         return
-    pyautogui.click(x, y, clicks=clicks)
+    if pyautogui:
+        pyautogui.click(x, y, clicks=clicks)
+
+
+_VK = {
+    "ctrl": 0x11,
+    "shift": 0x10,
+    "alt": 0x12,
+    "enter": 0x0D,
+    "down": 0x28,
+    "up": 0x26,
+    "backspace": 0x08,
+    "space": 0x20,
+    "esc": 0x1B,
+    "a": 0x41,
+    "f": 0x46,
+}
+
+
+def _win32_tap(*keys: str) -> None:
+    """Send keys with the Win32 keybd_event API — not pyautogui."""
+    if os.name != "nt":
+        if pyautogui:
+            pyautogui.hotkey(*keys) if len(keys) > 1 else pyautogui.press(keys[0])
+        return
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    KEYUP = 0x0002
+    vks = [_VK[k.lower()] for k in keys if k.lower() in _VK]
+    if not vks:
+        return
+    for vk in vks:
+        user32.keybd_event(vk, 0, 0, 0)
+        time.sleep(0.02)
+    for vk in reversed(vks):
+        user32.keybd_event(vk, 0, KEYUP, 0)
+        time.sleep(0.02)
 
 
 # WhatsApp Desktop: left icon rail is ~72 CSS px, chat list ~365 CSS px.
@@ -1009,20 +1073,27 @@ def _uia_windows(*, popups_only: bool = False):
 
 
 def _invoke_named(ctrl) -> bool:
+    """Activate a control. WebView2 html-buttons ignore UIA Invoke — click the rect."""
+    try:
+        ctrl.set_focus()
+    except Exception:
+        pass
+    try:
+        ctrl.click_input()
+        return True
+    except Exception:
+        pass
+    try:
+        r = ctrl.rectangle()
+        _click_screen((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+        return True
+    except Exception:
+        pass
     try:
         ctrl.invoke()
         return True
     except Exception:
-        try:
-            ctrl.click_input()
-            return True
-        except Exception:
-            try:
-                r = ctrl.rectangle()
-                _click_screen((r.left + r.right) // 2, (r.top + r.bottom) // 2)
-                return True
-            except Exception:
-                return False
+        return False
 
 
 def _invoke_button(names: tuple[str, ...], *, timeout: float = 0.55) -> bool:
@@ -1065,7 +1136,7 @@ def _button_exists(names: tuple[str, ...], *, timeout: float = 0.35) -> bool:
 
 
 def _with_whatsapp_cdp_page():
-    """Return Playwright page for web.whatsapp.com when CDP debugging is enabled."""
+    """Playwright page for Store WhatsApp's WebView2 when remote debugging is on."""
     port = _cdp_listening_port()
     if not port:
         return None, None
@@ -1079,10 +1150,15 @@ def _with_whatsapp_cdp_page():
         return None, None
     try:
         browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        pages = []
         for ctx in browser.contexts:
-            for page in ctx.pages:
-                if "web.whatsapp.com" in (page.url or ""):
-                    return pw, page
+            pages.extend(ctx.pages)
+        for page in pages:
+            url = (page.url or "").lower()
+            if "whatsapp" in url:
+                return pw, page
+        if pages:
+            return pw, pages[0]
     except Exception:
         pass
     try:
@@ -1273,6 +1349,32 @@ def _list_search_edit(*, allow_favourites: bool = False):
     return None
 
 
+def _uia_set_text(ed, text: str) -> bool:
+    """Type into a UIA edit without pyautogui."""
+    text = text or ""
+    try:
+        ed.set_focus()
+    except Exception:
+        pass
+    try:
+        ed.set_edit_text(text)
+        return True
+    except Exception:
+        pass
+    try:
+        from pywinauto.keyboard import send_keys
+
+        send_keys("^a{BACKSPACE}", pause=0.02)
+        if text:
+            escaped = "".join(
+                ("{" + ch + "}") if ch in "+^%~(){}[]" else ch for ch in text
+            )
+            send_keys(escaped, with_spaces=True, pause=0.015)
+        return True
+    except Exception:
+        return False
+
+
 def _click_search_edit(ed) -> None:
     try:
         r = ed.rectangle()
@@ -1336,9 +1438,9 @@ def _select_search_result(contact: str) -> bool:
     if _uia_open_chat(contact):
         return True
 
-    pyautogui.press("down")
+    _win32_tap("down")
     time.sleep(0.1)
-    pyautogui.press("enter")
+    _win32_tap("enter")
     time.sleep(0.4)
     if _uia_open_chat(contact):
         return True
@@ -1359,14 +1461,15 @@ def _open_chat_unlocked(contact: str) -> str:
     time.sleep(0.25)
 
     _focus_search_box()
-    osn = _os_name()
-    select = ("command", "a") if osn == "mac" else ("ctrl", "a")
-    pyautogui.hotkey(*select)
-    time.sleep(0.05)
-    pyautogui.press("backspace")
-    time.sleep(0.06)
-    _paste(contact)
-    time.sleep(0.9)
+    ed = _list_search_edit()
+    typed = bool(ed is not None and _uia_set_text(ed, contact))
+    if not typed:
+        _win32_tap("ctrl", "a")
+        time.sleep(0.05)
+        _win32_tap("backspace")
+        time.sleep(0.05)
+        _paste(contact)
+    time.sleep(0.85)
 
     if not _select_search_result(contact):
         return (
@@ -1635,34 +1738,20 @@ _FORCE_CLICK_JS = """
 
 
 def _click_call_via_cdp(*, video: bool) -> bool:
-    """Click call button in WhatsApp WebView2 when remote debugging is enabled."""
+    """Trusted Playwright click — WhatsApp ignores synthetic JS click events."""
     pw, page = _with_whatsapp_cdp_page()
     if not page:
         return False
-    selectors = (
-        [
-            'button[aria-label="Video call"]',
-            'span[data-icon="video-call"]',
-            '[data-icon="video-call"]',
-            '[aria-label*="ideo call" i]',
-        ]
-        if video
-        else [
-            'button[aria-label="Voice call"]',
-            'span[data-icon="audio-call"]',
-            'span[data-icon="voice-call"]',
-            '[data-icon="audio-call"]',
-            '[aria-label*="oice call" i]',
-        ]
-    )
+    name = "Video call" if video else "Voice call"
     try:
-        for sel in selectors:
-            try:
-                if page.evaluate(_FORCE_CLICK_JS, sel):
-                    time.sleep(0.45)
-                    return True
-            except Exception:
-                continue
+        loc = page.get_by_role("button", name=name)
+        if loc.count() == 0:
+            loc = page.locator(f'[aria-label="{name}"]')
+        loc.first.click(timeout=2500)
+        time.sleep(0.45)
+        return True
+    except Exception as e:
+        print(f"[WhatsApp] CDP click failed: {e}")
         return False
     finally:
         try:
@@ -1749,17 +1838,20 @@ def _click_header_call(*, video: bool = False, contact: str = "") -> bool:
         if not _conversation_looks_open():
             return False
 
+    if _cdp_listening_port() and _click_call_via_cdp(video=video):
+        time.sleep(0.45)
+        if _call_started(before, before_center):
+            return True
+
     names = _VIDEO_BTN if video else _VOICE_BTN
     if _invoke_main_button(names):
         time.sleep(0.45)
         if _call_started(before, before_center):
             return True
-        time.sleep(0.7)
+        _win32_tap("space")
+        time.sleep(0.5)
         if _call_started(before, before_center):
             return True
-
-    if _cdp_listening_port() and _click_call_via_cdp(video=video) and _call_started(before, before_center):
-        return True
 
     if _scan_header_clicks(video=video, before=before, before_center=before_center):
         return True

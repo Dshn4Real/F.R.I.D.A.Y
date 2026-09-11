@@ -41,6 +41,15 @@ SNAP_ABS = 0.34
 SNAP_FAST = 0.48
 SNAP_DROP = 0.22
 
+# Peace (index+middle) / thumbs-up / YOLO (index+pinky)
+FINGER_UP = 1.42
+FINGER_DOWN = 1.32
+POSE_HOLD_FRAMES = 8
+POSE_COOL = 0.85
+LM_SMOOTH = 0.32
+CURSOR_SMOOTH = 0.28
+HAND_MATCH = 0.28
+
 
 def _xyz(p) -> tuple[float, float, float]:
     if len(p) >= 3:
@@ -93,11 +102,22 @@ class HandMetrics:
     soft_open: bool
     claw: bool
     claw_hold: bool
+    peace: bool = False
+    thumbs: bool = False
+    yolo: bool = False
     c8: float = 0.0
     c12: float = 0.0
     c16: float = 0.0
     c20: float = 0.0
     garbage: bool = False
+
+
+def _finger_up(pts, tip: int, mcp: int) -> bool:
+    return _d2(pts[tip], pts[WRIST]) > FINGER_UP * _d2(pts[mcp], pts[WRIST])
+
+
+def _finger_down(pts, tip: int, mcp: int) -> bool:
+    return _d2(pts[tip], pts[WRIST]) < FINGER_DOWN * _d2(pts[mcp], pts[WRIST])
 
 
 def _finger_ratio(pts, tip: int, mcp: int) -> float:
@@ -146,6 +166,22 @@ def measure(hand) -> HandMetrics | None:
         for tip, mcp in ((8, 5), (12, 9), (16, 13), (20, 17))
         if _d2(pts[tip], w) > 1.45 * _d2(pts[mcp], w)
     )
+    idx_up, mid_up = _finger_up(pts, 8, 5), _finger_up(pts, 12, 9)
+    pnk_up = _finger_up(pts, 20, 17)
+    ring_dn, pnk_dn = _finger_down(pts, 16, 13), _finger_down(pts, 20, 17)
+    mid_dn = _finger_down(pts, 12, 9)
+    idx_dn = _finger_down(pts, 8, 5)
+    peace = idx_up and mid_up and ring_dn and pnk_dn and ratio > 0.38
+    yolo = idx_up and pnk_up and mid_dn and ring_dn
+    thumb_tip, thumb_mcp = pts[THUMB], pts[2]
+    thumb_ext = _d2(thumb_tip, w) > 1.35 * _d2(thumb_mcp, w)
+    thumb_up = (thumb_mcp[1] - thumb_tip[1]) > max(0.02, abs(thumb_tip[0] - thumb_mcp[0]) * 0.55)
+    knuckle_y = (pts[5][1] + pts[9][1] + pts[13][1] + pts[17][1]) / 4.0
+    thumbs = (
+        thumb_ext and thumb_up and idx_dn and mid_dn and ring_dn and pnk_dn
+        and thumb_tip[1] < knuckle_y - 0.01
+        and not peace
+    )
     c8 = _curl(pts, 5, 6, 7, 8)
     c12 = _curl(pts, 9, 10, 11, 12)
     c16 = _curl(pts, 13, 14, 15, 16)
@@ -187,6 +223,9 @@ def measure(hand) -> HandMetrics | None:
         soft_open=ext >= 3 and ratio > 0.7,
         claw=claw_at(False),
         claw_hold=claw_at(True),
+        peace=peace,
+        thumbs=thumbs,
+        yolo=yolo,
         c8=c8,
         c12=c12,
         c16=c16,
@@ -228,6 +267,43 @@ def peak_velocity(history: list) -> tuple[float, float, float, float]:
     return pk, vx, vy, last
 
 
+def smooth_landmarks(cur: Cursor, pts: list, alpha: float = LM_SMOOTH) -> list:
+    """EMA-blend 21 landmarks so finger flags don't flicker every frame."""
+    if not pts:
+        return pts
+    prev = cur.lm
+    if not prev or len(prev) != len(pts):
+        cur.lm = [tuple(p) for p in pts]
+        return cur.lm
+    jump = math.hypot(prev[0][0] - pts[0][0], prev[0][1] - pts[0][1])
+    blend = 1.0 if jump > 0.08 else (0.55 if jump > 0.04 else alpha)
+    out = []
+    for a, b in zip(prev, pts):
+        az = a[2] if len(a) > 2 else 0.0
+        bz = b[2] if len(b) > 2 else 0.0
+        out.append((
+            a[0] + (b[0] - a[0]) * blend,
+            a[1] + (b[1] - a[1]) * blend,
+            az + (bz - az) * blend,
+        ))
+    cur.lm = out
+    return out
+
+
+def fire_pose(cur: Cursor, active: bool, attr: str, now: float, board_until: float = 0.0) -> bool:
+    """Rising-edge after a short hold, then cooldown. Survives a one-frame miss."""
+    run = int(getattr(cur, attr, 0))
+    run = run + 1 if active else max(0, run - 1)
+    setattr(cur, attr, run)
+    if now < board_until or now < cur.pose_cool:
+        return False
+    if active and run >= POSE_HOLD_FRAMES:
+        setattr(cur, attr, 0)
+        cur.pose_cool = now + POSE_COOL
+        return True
+    return False
+
+
 @dataclass
 class Cursor:
     x: float = 0.5
@@ -257,16 +333,27 @@ class Cursor:
     fp_lit: float = 0.0
     fp_lost: float = 0.0
     fp_ready: bool = False
+    peace_run: int = 0
+    thumb_run: int = 0
+    yolo_run: int = 0
+    pose_cool: float = 0.0
+    lm: list = field(default_factory=list)
+    pin_on_run: int = 0
+    pin_off_run: int = 0
     rh: list = field(default_factory=list)
     dbg: str = ""
     scrub: dict | None = None
 
 
 def decide_pinch(cur: Cursor, m: HandMetrics, holding: bool, now: float) -> bool:
-    """OK-sign pinch with speed-aware release. Same gates as barehands."""
+    """OK-sign pinch with speed-aware release and frame hysteresis."""
     was = cur.pinched
-    if m.garbage:
+    if m.garbage or m.peace or m.thumbs or m.yolo:
         cur.prob_kill = True
+        cur.pin_on_run = 0
+        cur.pin_off_run += 1
+        if was and holding and cur.pin_off_run < PINCH_OFF_FRAMES + 2:
+            return True
         return False
     cur.ok_ema = 0.70 * cur.ok_ema + 0.30 * (1.0 if m.ok_sign else 0.0)
     ok_now = m.ok_sign and cur.ok_prev
@@ -277,22 +364,33 @@ def decide_pinch(cur: Cursor, m: HandMetrics, holding: bool, now: float) -> bool
     rel_ok = (open_read and cur.open_prev) if hspd > FAST_SPEED else open_read
     cur.open_prev = open_read
     ceiling = PINCH_ON_PROFILE if m.aspect < 2.0 else PINCH_ON_FRONT
-    pinched = (
+    raw = (
         (not rel_ok)
         if was
         else (m.ratio < ceiling and (ok_now or cur.ok_ema > 0.55 or holding))
     )
-    if pinched and not was:
+    if raw:
+        cur.pin_on_run += 1
+        cur.pin_off_run = 0
+    else:
+        cur.pin_off_run += 1
+        cur.pin_on_run = 0
+    if raw and not was:
         cur.bad_run = 0
         cur.prob_kill = False
-    elif pinched and was and now - cur.pinch_t < 0.40 and hspd < 0.62 and not holding:
+    elif raw and was and now - cur.pinch_t < 0.40 and hspd < 0.62 and not holding:
         cur.bad_run = 0 if m.ok_sign else cur.bad_run + 1
         if cur.bad_run >= 4:
-            pinched = False
+            raw = False
             cur.prob_kill = True
+            cur.pin_on_run = 0
+            cur.pin_off_run += 1
     else:
         cur.bad_run = 0
-    return pinched
+    off_need = PINCH_OFF_FRAMES + (1 if holding else 0)
+    if was or holding:
+        return cur.pin_off_run < off_need
+    return cur.pin_on_run >= PINCH_ON_FRAMES
 
 
 def claw_snap(cur: Cursor, ratio: float, now: float) -> bool:

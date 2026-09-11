@@ -1645,7 +1645,10 @@ class _HandsOrbLayer(QWidget):
 
 
 class HandsBoardWidget(QWidget):
-    """Local MediaPipe 21-point skeleton board. OpenCV draws; HUD shows the camera."""
+    """Local MediaPipe 21-point skeleton board. OpenCV draws; HUD shows the camera.
+
+    GPU hologram overlay is created only while a 3D model is on the glass.
+    """
 
     _status_sig = pyqtSignal(str)
 
@@ -1665,7 +1668,7 @@ class HandsBoardWidget(QWidget):
         title.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
         title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
         hdr.addWidget(title)
-        self._hint = QLabel("Drop a file on the glass · pinch · clap · O open · C cam · R reset")
+        self._hint = QLabel("Drop a file · pinch · peace explode · thumbs assemble · clap · O open")
         self._hint.setFont(QFont("Courier New", 7))
         self._hint.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
         hdr.addWidget(self._hint, stretch=1)
@@ -1702,6 +1705,8 @@ class HandsBoardWidget(QWidget):
         self._last_frame: QPixmap | None = None
         self._pending = None
         self._need_scale = True
+        self._gl = None
+        self._gl_failed = False
         self._orb_layer = _HandsOrbLayer(self)
         self._orb_tmr = QTimer(self)
         self._orb_tmr.setInterval(33)
@@ -1796,6 +1801,43 @@ class HandsBoardWidget(QWidget):
             self._running = False
             self._idle.set()
 
+    def _has_model(self) -> bool:
+        return any(c.kind == "model" for c in self.engine.snapshot())
+
+    def _ensure_gl(self):
+        if self._gl is not None or self._gl_failed:
+            return self._gl
+        try:
+            from actions.hands_gl import HandsGLRenderer
+            rend = HandsGLRenderer()
+            if not rend.start():
+                self._gl_failed = True
+                self.engine.gpu_models = False
+                return None
+            self._gl = rend
+            return rend
+        except Exception as e:
+            self._gl_failed = True
+            self.engine.gpu_models = False
+            print(f"[Hands] GPU models unavailable ({e})")
+            return None
+
+    def _release_gl(self) -> None:
+        self.engine.gpu_models = False
+        gl = self._gl
+        self._gl = None
+        if gl is not None:
+            try:
+                gl.close()
+            except Exception:
+                pass
+
+    def _gpu_failed(self, msg: str) -> None:
+        self._gl_failed = True
+        self._release_gl()
+        self._need_scale = True
+        print(f"[Hands] GPU models fallback ({msg})")
+
     def _present_board_frame(self) -> None:
         pending = self._pending
         self._pending = None
@@ -1809,18 +1851,41 @@ class HandsBoardWidget(QWidget):
         if src is None or src.isNull():
             self._orb_layer.update()
             return
-        if self._need_scale:
+        has_model = self._has_model()
+        if has_model and not self._gl_failed:
+            self.engine.gpu_models = True
+        else:
+            self.engine.gpu_models = False
+            if self._gl is not None and not has_model:
+                self._release_gl()
+        if self._need_scale or has_model:
             vw, vh = self._view.width(), self._view.height()
             if vw > 1 and vh > 1:
-                self._view.setPixmap(
-                    src.scaled(
-                        vw, vh,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.FastTransformation,
-                    )
+                pix = src.scaled(
+                    vw, vh,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.FastTransformation,
                 )
             else:
-                self._view.setPixmap(src)
+                pix = src
+            if has_model and not self._gl_failed:
+                rend = self._ensure_gl()
+                if rend is not None:
+                    holo = rend.render(
+                        pix.width(), pix.height(),
+                        src.width(), src.height(),
+                        self.engine,
+                    )
+                    if holo is not None and not holo.isNull():
+                        painted = QPixmap(pix)
+                        p = QPainter(painted)
+                        p.drawImage(painted.rect(), holo)
+                        p.end()
+                        pix = painted
+                    elif getattr(rend, "failed", False):
+                        self._gpu_failed("render failed")
+                        self.engine.gpu_models = False
+            self._view.setPixmap(pix)
             self._need_scale = False
         if self._running:
             banner = self.engine.banner()
@@ -1845,6 +1910,7 @@ class HandsBoardWidget(QWidget):
         self._pending = None
         self._last_frame = None
         self._view.clear()
+        self._release_gl()
         self._orb_layer.update()
 
 
@@ -3753,6 +3819,9 @@ class MainWindow(QMainWindow):
     def _cam_loop(self) -> None:
         try:
             import cv2
+            idle = getattr(self._hands_widget, "_idle", None)
+            if idle is not None:
+                idle.wait(2.5)
             # Reuse camera index detected by screen_processor (cached in api_keys.json)
             cam_idx = 0
             try:

@@ -1,7 +1,8 @@
 """Load GLB / glTF / OBJ as explode-ready mesh parts for the hands board.
 
-Renders in OpenCV as a cyan hologram (or a shaded solid). No three.js.
-Parts are per-mesh nodes so explode/assemble has something to pull apart.
+The live HUD draws these on the GPU (cyan hologram wires). OpenCV is only
+a fallback. Parts are per-mesh nodes so explode/assemble has something to
+pull apart.
 """
 
 from __future__ import annotations
@@ -15,6 +16,9 @@ import numpy as np
 
 _CACHE: dict[str, "HoloModel"] = {}
 _MAX_EDGES = 2800
+_CPU_EDGE_FACES = 4000
+_MAX_TRIS = 120_000
+_MAX_VERTS = 250_000
 _MODEL_EXTS = {".glb", ".gltf", ".obj"}
 
 
@@ -43,6 +47,9 @@ class HoloModel:
     parts: list[MeshPart] = field(default_factory=list)
     path: str = ""
     explodeable: bool = False
+    gpu_pos: np.ndarray | None = field(default=None, repr=False)
+    gpu_dir: np.ndarray | None = field(default=None, repr=False)
+    gpu_idx: np.ndarray | None = field(default=None, repr=False)
 
 
 def demo_engine() -> HoloModel:
@@ -122,6 +129,87 @@ def _edges_from_faces(faces: np.ndarray) -> np.ndarray:
     return np.unique(raw, axis=0)
 
 
+def _cpu_edges(faces: np.ndarray, pos: np.ndarray) -> np.ndarray:
+    """Unique edges only for tiny meshes — the GPU path uses raw triangle lines."""
+    if faces is None or len(faces) == 0:
+        return _wire_fallback(pos)
+    if len(faces) <= _CPU_EDGE_FACES:
+        return _cap_edges(_edges_from_faces(faces))
+    return np.zeros((0, 2), np.int32)
+
+
+def _compact_part(p: MeshPart) -> MeshPart:
+    if p.faces.size == 0 or len(p.verts) == 0:
+        return p
+    used = np.unique(p.faces)
+    if len(used) >= len(p.verts):
+        return p
+    remap = np.full(len(p.verts), -1, np.int32)
+    remap[used] = np.arange(len(used), dtype=np.int32)
+    verts = np.ascontiguousarray(p.verts[used], np.float32)
+    faces = remap[p.faces]
+    return MeshPart(verts, _cpu_edges(faces, verts), faces, verts.mean(axis=0), p.direction)
+
+
+def _budget_parts(parts: list[MeshPart]) -> list[MeshPart]:
+    total = int(sum(len(p.faces) for p in parts))
+    verts = int(sum(len(p.verts) for p in parts))
+    if total <= _MAX_TRIS and verts <= _MAX_VERTS:
+        return [_compact_part(p) if len(p.faces) else p for p in parts]
+    out = []
+    for p in parts:
+        faces = p.faces
+        if total > _MAX_TRIS and len(faces) > 32:
+            keep = max(32, int(len(faces) * _MAX_TRIS / max(total, 1)))
+            step = max(1, len(faces) // keep)
+            faces = faces[::step][:keep]
+        part = MeshPart(p.verts, _cpu_edges(faces, p.verts), faces, p.centroid, p.direction)
+        out.append(_compact_part(part))
+    return out
+
+
+def gpu_pack(model: HoloModel) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Concatenate parts into GPU arrays: positions, explode directions, line indices."""
+    pos_list: list[np.ndarray] = []
+    dir_list: list[np.ndarray] = []
+    idx_list: list[np.ndarray] = []
+    base = 0
+    for part in model.parts:
+        verts = np.ascontiguousarray(part.verts, np.float32)
+        n = len(verts)
+        if n == 0:
+            continue
+        pos_list.append(verts)
+        direction = np.asarray(part.direction, np.float32).reshape(3)
+        dir_list.append(np.broadcast_to(direction, (n, 3)).copy())
+        if len(part.faces):
+            faces = np.ascontiguousarray(part.faces, np.int32)
+            lines = np.empty((len(faces) * 6,), np.uint32)
+            lines[0::6] = faces[:, 0]
+            lines[1::6] = faces[:, 1]
+            lines[2::6] = faces[:, 1]
+            lines[3::6] = faces[:, 2]
+            lines[4::6] = faces[:, 2]
+            lines[5::6] = faces[:, 0]
+            idx_list.append(lines + base)
+        elif len(part.edges):
+            idx_list.append((np.ascontiguousarray(part.edges, np.uint32) + base).reshape(-1))
+        base += n
+    if not pos_list:
+        empty = np.zeros((0, 3), np.float32)
+        return empty, empty, np.zeros((0,), np.uint32)
+    pos = np.vstack(pos_list)
+    dr = np.vstack(dir_list)
+    idx = np.concatenate(idx_list) if idx_list else np.zeros((0,), np.uint32)
+    return pos, dr, idx
+
+
+def ensure_gpu(model: HoloModel) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if model.gpu_pos is None or model.gpu_dir is None or model.gpu_idx is None:
+        model.gpu_pos, model.gpu_dir, model.gpu_idx = gpu_pack(model)
+    return model.gpu_pos, model.gpu_dir, model.gpu_idx
+
+
 def _normalize_parts(parts: list[MeshPart], path: str = "") -> HoloModel:
     if not parts:
         parts = [_box(0, 0, 0, 1, 1, 1)]
@@ -139,7 +227,9 @@ def _normalize_parts(parts: list[MeshPart], path: str = "") -> HoloModel:
         else:
             direction = direction / n
         out.append(MeshPart(verts, p.edges, p.faces, centroid, direction.astype(np.float32)))
-    return HoloModel(parts=out, path=path, explodeable=len(out) > 1)
+    model = HoloModel(parts=_budget_parts(out), path=path, explodeable=len(out) > 1)
+    ensure_gpu(model)
+    return model
 
 
 def _cap_edges(edges: np.ndarray) -> np.ndarray:
@@ -164,7 +254,7 @@ def _load_obj(path: Path) -> HoloModel:
                 faces.append([idx[0], idx[i], idx[i + 1]])
     v = np.array(verts, np.float32) if verts else np.zeros((1, 3), np.float32)
     f = np.array(faces, np.int32) if faces else np.zeros((0, 3), np.int32)
-    part = MeshPart(v, _cap_edges(_edges_from_faces(f)), f, v.mean(axis=0), np.zeros(3, np.float32))
+    part = MeshPart(v, _cpu_edges(f, v), f, v.mean(axis=0), np.zeros(3, np.float32))
     return _normalize_parts([part], str(path))
 
 
@@ -297,7 +387,7 @@ def _load_gltf(path: Path) -> HoloModel:
             m = int(faces.max(initial=0))
             if m >= len(pos):
                 faces = faces[np.all(faces < len(pos), axis=1)]
-        edges = _cap_edges(_edges_from_faces(faces)) if len(faces) else _wire_fallback(pos)
+        edges = _cpu_edges(faces, pos)
         if len(pos) == 0:
             return
         parts.append(MeshPart(pos, edges, faces, pos.mean(axis=0), np.zeros(3, np.float32)))
