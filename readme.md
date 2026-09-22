@@ -1,20 +1,5 @@
 # FRIDAY 4.0
 
-Clean rebuild of FRIDAY on the **Mark LII (Mark 52)** workflow — every Mark 52
-tool and HUD capability, rebranded and refined for Prompt Wars.
-
-## What this is
-
-Friday 4.0 is **not** a thin wrapper on Friday 3.0. It is a fresh project folder
-copied from Mark-LII’s full Gemini Live stack, then:
-
-- Rebranded JARVIS → **FRIDAY**
-- Default assistant name / theme / Opera GX preference set
-- Browser detection honours `preferred_browser` in config
-- Same tool surface as Mark 52 (open apps, computer control, browser, files,
-  vision, memory, undo, confirm, plugins, dashboard, proactive, monitors, …)
-
-## Mirrored Mark 52 capabilities
 
 | Area | Tools / features |
 |------|------------------|
