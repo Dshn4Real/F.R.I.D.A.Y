@@ -104,7 +104,3 @@ friday-4.0/
 └── config/api_keys.json # encrypted key + preferences (AES-256-GCM)
 ```
 
-## Attribution
-
-Core workflow derived from [Mark-LII](https://github.com/FatihMakes/Mark-LII)
-(CC BY-NC 4.0). FRIDAY 4.0 is a personalization / hackathon fork for non-commercial use.
